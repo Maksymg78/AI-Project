@@ -1,108 +1,165 @@
+import ipywidgets as widgets
+import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMClassifier
+from IPython.display import display
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 
-# ------------------------------------------------------------------
-# 1. Генерація демонстраційних даних (симуляція часового ряду)
-# ------------------------------------------------------------------
+print("1. Генерація просторово-часових даних для всіх областей України...")
+
+# Список усіх регіонів України
+regions = [
+    "м. Київ",
+    "Київська",
+    "Харківська",
+    "Одеська",
+    "Дніпропетровська",
+    "Запорізька",
+    "Львівська",
+    "Миколаївська",
+    "Полтавська",
+    "Чернігівська",
+    "Сумська",
+    "Житомирська",
+    "Черкаська",
+    "Вінницька",
+    "Кіровоградська",
+    "Хмельницька",
+    "Рівненська",
+    "Волинська",
+    "Івано-Франківська",
+    "Тернопільська",
+    "Чернівецька",
+    "Закарпатська",
+    "Херсонська",
+    "Донецька",
+    "Луганська",
+    "АР Крим",
+    "м. Севастополь",
+]
+
+# Генерація погодинного часового ряду
+start_date = "2026-01-01"
+end_date = pd.Timestamp.now()
+dates = pd.date_range(start=start_date, end=end_date, freq="1h")
+
+# Створення матриці даних для всіх регіонів
 np.random.seed(42)
-dates = pd.date_range(start="2024-01-01", end="2024-06-01", freq="1h")
-df = pd.DataFrame({"datetime": dates})
+data_dict = {
+    "datetime": np.tile(dates, len(regions)),
+    "region": np.repeat(regions, len(dates)),
+    "is_alert": np.random.binomial(1, 0.15, len(dates) * len(regions)),
+}
 
-# Симулюємо статус тривоги (1 - є тривога, 0 - немає) для Києва та сусідніх областей
-# Враховуємо географічну кореляцію: якщо тривога в сусідній області, зростає шанс у Києві
-df["alert_kyiv_region"] = np.random.binomial(1, 0.2, len(df))
-df["alert_zhytomyr"] = np.random.binomial(1, 0.15, len(df))
-df["alert_chernihiv"] = np.random.binomial(1, 0.18, len(df))
+df_all = pd.DataFrame(data_dict)
+print(f"Загальна кількість рядків у матриці (регіони x години): {len(df_all)}")
 
-# Київська міська тривога сильно залежить від Київської області та сусідів
-prob_kyiv = 0.5 * df["alert_kyiv_region"] + 0.2 * df["alert_chernihiv"] + 0.1
-df["alert_kyiv"] = np.random.binomial(1, prob_kyiv.clip(0, 1))
+# ===================================================================
+# 2. Інженерія просторово-часових ознак
+# ===================================================================
+print("2. Створення ознак та крос-регіональних лагів...")
 
-# ------------------------------------------------------------------
-# 2. Інженерія ознак (Feature Engineering)
-# ------------------------------------------------------------------
+df_all["hour"] = df_all["datetime"].dt.hour
+df_all["dayofweek"] = df_all["datetime"].dt.dayofweek
+df_all["hour_sin"] = np.sin(2 * np.pi * df_all["hour"] / 24)
+df_all["hour_cos"] = np.cos(2 * np.pi * df_all["hour"] / 24)
 
-# А. Циклічні ознаки часу (година доби та день тижня)
-df["hour"] = df["datetime"].dt.hour
-df["dayofweek"] = df["datetime"].dt.dayofweek
+df_all["alert_lag1"] = df_all.groupby("region")["is_alert"].shift(1)
+df_all["alert_lag2"] = df_all.groupby("region")["is_alert"].shift(2)
+df_all["rolling_6h"] = (
+    df_all.groupby("region")["is_alert"]
+    .shift(1)
+    .rolling(6)
+    .sum()
+    .reset_index(0, drop=True)
+)
 
-df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
-df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
-df["dow_sin"] = np.sin(2 * np.pi * df["dayofweek"] / 7)
-df["dow_cos"] = np.cos(2 * np.pi * df["dayofweek"] / 7)
+df_all["target_next_hour"] = df_all.groupby("region")["is_alert"].shift(-1)
+df_clean = df_all.dropna().copy()
+df_clean["region_code"] = df_clean["region"].astype("category")
 
-# Б. Лаги (статус тривог у сусідніх областях 1 та 2 години тому)
-for col in ["alert_kyiv_region", "alert_zhytomyr", "alert_chernihiv"]:
-    df[f"{col}_lag1"] = df[col].shift(1)
-    df[f"{col}_lag2"] = df[col].shift(2)
+# ===================================================================
+# 3. Навчання єдиної мультирегіональної моделі
+# ===================================================================
+print("3. Навчання універсальної моделі для всіх областей...")
 
-# В. Інтенсивність (кількість тривог у Києві за останні 6 та 24 години)
-df["kyiv_rolling_6h"] = df["alert_kyiv"].shift(1).rolling(window=6).sum()
-df["kyiv_rolling_24h"] = df["alert_kyiv"].shift(1).rolling(window=24).sum()
-
-# Г. Цільова змінна (Target): чи буде тривога в Києві у наступну годину (Shift -1)
-df["target_kyiv_next_hour"] = df["alert_kyiv"].shift(-1)
-
-# Видаляємо строки з порожніми значеннями (NaN), що виникли через shift/rolling
-df_clean = df.dropna().copy()
-
-# ------------------------------------------------------------------
-# 3. Підготовка даних та навчання моделі
-# ------------------------------------------------------------------
-
-# Вибираємо всі ознаки для навчання
 features = [
+    "region_code",
     "hour_sin",
     "hour_cos",
-    "dow_sin",
-    "dow_cos",
-    "alert_kyiv_region_lag1",
-    "alert_kyiv_region_lag2",
-    "alert_zhytomyr_lag1",
-    "alert_zhytomyr_lag2",
-    "alert_chernihiv_lag1",
-    "alert_chernihiv_lag2",
-    "kyiv_rolling_6h",
-    "kyiv_rolling_24h",
+    "alert_lag1",
+    "alert_lag2",
+    "rolling_6h",
 ]
 
 X = df_clean[features]
-y = df_clean["target_kyiv_next_hour"]
+y = df_clean["target_next_hour"]
 
-# Важливо для часових рядів: split робимо без перемішування (shuffle=False)
 X_train, X_test, y_train, y_test = train_test_split(
     X, y, test_size=0.2, shuffle=False
 )
 
-# Модель градієнтного бустингу
-model = LGBMClassifier(
-    n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42
+model = lgb.LGBMClassifier(
+    n_estimators=100, learning_rate=0.05, max_depth=5, random_state=42
 )
-
 model.fit(X_train, y_train)
 
-# ------------------------------------------------------------------
-# 4. Оцінка якості та прогноз ймовірності
-# ------------------------------------------------------------------
-
-# Отримуємо ймовірності (predict_proba повертає [ймовірність_0, ймовірність_1])
 y_pred_proba = model.predict_proba(X_test)[:, 1]
-
-# Оцінка метрики ROC-AUC (кільки добре модель розділяє класи)
-auc_score = roc_auc_score(y_test, y_pred_proba)
-print(f"Якість моделі (ROC-AUC Score): {auc_score:.3f}\n")
-
-# Симуляція прогнозу для останнього відомого моменту часу
-last_sample = X_test.iloc[[-1]]
-last_time = df_clean.iloc[X_test.index[-1]]["datetime"]
-
-predicted_prob = model.predict_proba(last_sample)[0][1]
-
-print("--- Прогноз ймовірності тривоги ---")
-print(f"Дата та час аналізу: {last_time}")
 print(
-    f"Ймовірність оголошення тривоги у Києві в наступну годину: {predicted_prob * 100:.1f}%"
+    f"Мультирегіональну модель успішно навчено! ROC-AUC:"
+    f" {roc_auc_score(y_test, y_pred_proba):.3f}\n"
 )
+
+# ===================================================================
+# 4. Інтерактивний вибір регіону через випадаючий список (Dropdown)
+# ===================================================================
+print(
+    "4. Модель готова! Оберіть регіон у випадаючому списку нижче та натисніть"
+    " кнопку:"
+)
+
+# Створюємо віджет випадаючого списку
+region_dropdown = widgets.Dropdown(
+    options=regions,
+    value="Київська",
+    description="Регіон:",
+    style={"description_width": "initial"},
+)
+
+# Створюємо кнопку виконання
+button = widgets.Button(
+    description="Розрахувати прогноз",
+    button_style="success",  # зелена кнопка
+    icon="check",
+)
+
+# Поле для виведення результату
+output = widgets.Output()
+
+
+def on_button_clicked(b):
+  with output:
+    output.clear_output()
+    target_region = region_dropdown.value
+
+    # Шукаємо дані для обраного регіону
+    region_data = df_clean[df_clean["region"] == target_region]
+
+    if not region_data.empty:
+      last_sample = region_data.iloc[[-1]][features]
+      predicted_prob = model.predict_proba(last_sample)[0][1]
+      print(f"--- РЕЗУЛЬТАТ ПРОГНОЗУ ДЛЯ ОБЛАСТІ: {target_region} ---")
+      print(
+          "Ймовірність тривоги в регіоні"
+          f" '{target_region}' на наступну годину: **{predicted_prob * 100:.1f}%**"
+      )
+    else:
+      print("Не вдалося знайти дані для цього регіону.")
+
+
+# З'єднуємо кнопку з функцією обробки
+button.on_click(on_button_clicked)
+
+# Відображаємо елементи інтерфейсу в блокноті
+display(region_dropdown, button, output)
